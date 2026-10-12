@@ -2,7 +2,7 @@ name: Mahasarn queue monitor
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "*/5 * * * *"   # ทุก 5 นาที (GitHub อาจดีเลย์ได้บ้างช่วงคนใช้เยอะ)
   workflow_dispatch:
     inputs:
       discover:
@@ -20,31 +20,39 @@ jobs:
     timeout-minutes: 8
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
+
       - run: pip install -r requirements.txt && python -m playwright install --with-deps chromium
+
       - name: Restore last snapshot
         uses: actions/cache/restore@v4
         with:
           path: state
           key: snapshot-${{ github.run_id }}
           restore-keys: snapshot-
+
       - name: Check queue
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          AROIDED_EMAIL: ${{ secrets.AROIDED_EMAIL }}
+          AROIDED_PASSWORD: ${{ secrets.AROIDED_PASSWORD }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python monitor.py ${{ inputs.discover && '--discover' || '' }}
+
       - name: Save snapshot
         if: always()
         uses: actions/cache/save@v4
         with:
           path: state
           key: snapshot-${{ github.run_id }}
+
       - name: Upload debug files
-        if: inputs.discover
+        if: always() && inputs.discover
         uses: actions/upload-artifact@v4
         with:
           name: debug
