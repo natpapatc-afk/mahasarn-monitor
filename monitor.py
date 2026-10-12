@@ -36,11 +36,51 @@ DATE_RE = re.compile(
 EMPTY_HINTS = ("ไม่มี", "เต็ม", "no available", "sold out", "fully booked")
 
 
+SESSION = STATE.parent / "session.json"  # เก็บ cookie ล็อกอินไว้ใช้รอบถัดไป
+
+
+class LoginError(Exception):
+    pass
+
+
+def needs_login(page):
+    return page.locator("input[type=password]:visible").count() > 0
+
+
+def do_login(page):
+    email, password = os.getenv("AROIDED_EMAIL"), os.getenv("AROIDED_PASSWORD")
+    if not (email and password):
+        raise LoginError("หน้าเว็บต้องล็อกอิน แต่ยังไม่ได้ใส่ AROIDED_EMAIL / AROIDED_PASSWORD ใน Secrets")
+
+    email_box = page.locator(
+        "input[type=email]:visible, input[name*=mail i]:visible, input[id*=mail i]:visible, "
+        "input[name*=user i]:visible, input[type=text]:visible"
+    ).first
+    email_box.fill(email)
+    page.locator("input[type=password]:visible").first.fill(password)
+
+    submit = page.locator(
+        "button[type=submit]:visible, input[type=submit]:visible, "
+        "button:visible:has-text('เข้าสู่ระบบ'), button:visible:has-text('Login'), "
+        "button:visible:has-text('Log in'), button:visible:has-text('Sign in')"
+    ).first
+    if submit.count():
+        submit.click()
+    else:
+        page.keyboard.press("Enter")
+    page.wait_for_load_state("networkidle", timeout=60_000)
+    page.wait_for_timeout(3000)
+
+
 def scrape(discover=False):
     json_payloads = []
     with sync_playwright() as p:
         browser = p.chromium.launch()
-        page = browser.new_page(locale="th-TH", viewport={"width": 430, "height": 2000})
+        ctx = browser.new_context(
+            locale="th-TH", viewport={"width": 430, "height": 2000},
+            storage_state=str(SESSION) if SESSION.exists() else None,
+        )
+        page = ctx.new_page()
 
         def on_response(resp):
             try:
@@ -50,18 +90,37 @@ def scrape(discover=False):
                 pass
 
         page.on("response", on_response)
-        page.goto(URL, wait_until="networkidle", timeout=60_000)
-        page.wait_for_timeout(4000)  # เผื่อ render ช้า
-        text = page.inner_text("body")
 
-        if discover:
-            DEBUG_DIR.mkdir(exist_ok=True)
-            page.screenshot(path=str(DEBUG_DIR / "page.png"), full_page=True)
-            (DEBUG_DIR / "page.txt").write_text(text, encoding="utf-8")
-            (DEBUG_DIR / "api.json").write_text(
-                json.dumps(json_payloads, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
-        browser.close()
+        def snap(name):
+            if discover:
+                DEBUG_DIR.mkdir(exist_ok=True)
+                page.screenshot(path=str(DEBUG_DIR / f"{name}.png"), full_page=True)
+
+        try:
+            page.goto(URL, wait_until="networkidle", timeout=60_000)
+            page.wait_for_timeout(3000)
+            if needs_login(page):
+                snap("login-page")
+                do_login(page)
+                json_payloads.clear()
+                page.goto(URL, wait_until="networkidle", timeout=60_000)
+                page.wait_for_timeout(3000)
+                if needs_login(page):
+                    snap("login-failed")
+                    raise LoginError("ล็อกอินไม่ผ่าน — เช็กอีเมล/รหัสผ่านใน Secrets")
+                SESSION.parent.mkdir(parents=True, exist_ok=True)
+                ctx.storage_state(path=str(SESSION))
+
+            page.wait_for_timeout(2000)  # เผื่อ render ช้า
+            text = page.inner_text("body")
+            snap("page")
+            if discover:
+                (DEBUG_DIR / "page.txt").write_text(text, encoding="utf-8")
+                (DEBUG_DIR / "api.json").write_text(
+                    json.dumps(json_payloads, ensure_ascii=False, indent=2), encoding="utf-8"
+                )
+        finally:
+            browser.close()
     return text, json_payloads
 
 
@@ -104,7 +163,19 @@ def notify(title, body):
 
 def check_once(discover=False):
     now = datetime.now(BKK).strftime("%Y-%m-%d %H:%M:%S")
-    text, payloads = scrape(discover)
+    try:
+        text, payloads = scrape(discover)
+    except LoginError as e:
+        # แจ้งแค่ครั้งเดียวจนกว่าจะล็อกอินผ่าน จะได้ไม่เด้งรัวทุก 5 นาที
+        flag = STATE.parent / "login_failed"
+        if not flag.exists():
+            notify("⚠️ มหาสาร monitor: ล็อกอินไม่ได้", str(e))
+            flag.parent.mkdir(parents=True, exist_ok=True)
+            flag.write_text(now)
+        SESSION.unlink(missing_ok=True)
+        print("LOGIN ERROR:", e)
+        sys.exit(1)
+    (STATE.parent / "login_failed").unlink(missing_ok=True)
     slots = extract_slots(text)
     api_hash = hashlib.sha256(
         json.dumps([p["body"] for p in payloads], sort_keys=True, ensure_ascii=False).encode()
